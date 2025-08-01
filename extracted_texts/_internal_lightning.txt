@@ -1,0 +1,3 @@
+URL: https://www.mosdac.gov.in/internal/lightning
+
+{{appNameDisplay}} {{map.getLayers().getArray()[1].getLayers().getArray()[map.getLayers().getArray()[1].getLayers().getArray().length-1].values_.title}} {{slider.value}} {{timezone}} {{generalMessage.infoMsg.noLegends.message1}} Legends
