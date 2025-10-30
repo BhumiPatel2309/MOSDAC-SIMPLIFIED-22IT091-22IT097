@@ -38,7 +38,7 @@ def create_env_file():
 GEMINI_API_KEY=your_gemini_api_key_here
 
 # Optional: Override default settings
-# MODEL_NAME=gemini-1.5-flash
+# MODEL_NAME=gemini-1.5-flash-002
 # EMBEDDING_MODEL=all-MiniLM-L6-v2
 # CHUNK_SIZE=1000
 # CHUNK_OVERLAP=200

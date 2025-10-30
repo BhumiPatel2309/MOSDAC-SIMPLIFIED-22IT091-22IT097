@@ -5,8 +5,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration settings
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL_NAME = "gemini-1.5-flash"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
@@ -22,3 +20,8 @@ PAGE_TITLE = "MOSDAC SIMPLIFIED"
 PAGE_ICON = "🤖"
 LAYOUT = "wide"
 INITIAL_SIDEBAR_STATE = "expanded"
+# Gemini API Configuration
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable is required. Set it in your .env file.")
