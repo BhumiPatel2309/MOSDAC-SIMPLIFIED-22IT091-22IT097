@@ -247,7 +247,6 @@ def initialize_system():
         st.error(f"Error initializing system: {str(e)}")
         return False
 
-
 def display_chat_interface():
     """Display the chat interface with input at the bottom"""
     # Create a container for chat messages
@@ -295,18 +294,67 @@ def display_chat_interface():
     # If there's a new message, process and add the assistant's response
     if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
         user_message = st.session_state.messages[-1]["content"]
-        with chat_container:
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    if st.session_state.rag_engine:
-                        result = st.session_state.rag_engine.query(user_message)
-                        response = result["response"]
-                    else:
-                        response = "System not ready. Ensure MOSDAC.pdf exists and API key is set."
+        
+        # Start measuring response time
+        start_time = time.time()
+        
+        # Generate the response
+        if st.session_state.rag_engine:
+            result = st.session_state.rag_engine.query(user_message)
+            response = result["response"]
+        else:
+            response = "System not ready. Ensure MOSDAC.pdf exists and API key is set."
+        
+        response_time = int((time.time() - start_time) * 1000)  # in milliseconds
+        
+        # Log the chat and update query count in real-time
+        if 'user' in st.session_state and st.session_state.user:
+            try:
+                from dashboard import log_chat
                 
-                st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
-
+                # Clear any cached analytics data
+                if 'analytics_data' in st.session_state:
+                    del st.session_state.analytics_data
+                
+                # Log the chat and get the new query count
+                try:
+                    new_count = log_chat(
+                        user_id=st.session_state.user['id'],
+                        query=user_message,
+                        response=response,
+                        response_time_ms=response_time
+                    )
+                    
+                    # Update the UI immediately
+                    if 'user_stats' in st.session_state:
+                        st.session_state.user_stats['total_queries'] = new_count
+                    
+                    # Force a complete refresh of the analytics data
+                    if 'last_analytics' in st.session_state:
+                        del st.session_state.last_analytics
+                    
+                    # Add assistant's response to chat history
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    
+                    # Force a complete page refresh to ensure fresh data
+                    st.rerun()
+                    
+                except ValueError as ve:
+                    st.error(f"⚠️ {str(ve)}. Please log in again.")
+                    # Clear the session and redirect to login
+                    st.session_state.clear()
+                    st.rerun()
+                    
+            except Exception as e:
+                st.error(f"❌ Error logging chat: {str(e)}")
+                import traceback
+                st.error(traceback.format_exc())
+        
+        # If there's no user logged in, still show the response
+        else:
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.rerun()
+    
 
 def show_welcome_page():
     """Display welcome page with About MOSDAC information after successful login"""
@@ -543,7 +591,7 @@ def main():
         # Add a nice header to the sidebar with user info
         st.markdown(f"""
         <div style="text-align: center;">
-            <h2 style="color: #667eea; margin-bottom: 0;">MOSDAC</h2>
+            <h2 style="color: #667eea; margin-bottom: 0;">MOSDAC data is now simplified</h2>
             <p style="color: #6c757d; margin-top: 0;">Welcome, {st.session_state.get('username', 'User')}!</p>
         </div>
         <hr style="margin: 1rem 0;">
@@ -600,31 +648,37 @@ def main():
     
     # Create tabs for navigation based on user
     if 'username' in st.session_state:
-        # Regular user view with 2 tabs for all users including 'bhumi'
-        tab1, tab2 = st.tabs(["💬 Chat", "ℹ️ About"])
-        
-        with tab1:
-            if not st.session_state.initialized:
-                with st.spinner("Initializing system..."):
-                    initialize_system()
-                st.session_state.initialized = True
-            display_chat_interface()
+        # Show Analytics tab only for 'bhumi' user
+        if st.session_state.username.lower() == 'bhumi':
+            tab1, tab2, tab3 = st.tabs(["📊 Analytics", "💬 Chat", "ℹ️ About"])
             
-        with tab2:
-            show_welcome_page()
-    else:
-        # Regular user view with 2 tabs
-        tab1, tab2 = st.tabs(["💬 Chat", "ℹ️ About"])
-        
-        with tab1:
-            if not st.session_state.initialized:
-                with st.spinner("Initializing system..."):
-                    initialize_system()
-                st.session_state.initialized = True
-            display_chat_interface()
-            
-        with tab2:
-            show_welcome_page()
+            with tab1:
+                # Force refresh when Analytics tab is opened
+                if 'analytics_data' in st.session_state:
+                    del st.session_state.analytics_data
+                from dashboard import show_analytics_dashboard
+                show_analytics_dashboard()
+                
+            with tab2:
+                if not st.session_state.initialized:
+                    with st.spinner("Initializing system..."):
+                        initialize_system()
+                    st.session_state.initialized = True
+                display_chat_interface()
+                
+            with tab3:
+                show_welcome_page()
+        else:
+            # Regular user tabs
+            tab1, tab2 = st.tabs(["💬 Chat", "ℹ️ About"])
+            with tab1:
+                if not st.session_state.initialized:
+                    with st.spinner("Initializing system..."):
+                        initialize_system()
+                    st.session_state.initialized = True
+                display_chat_interface()
+            with tab2:
+                show_welcome_page()
 
 
 if __name__ == "__main__":

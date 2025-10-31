@@ -324,6 +324,7 @@ def show_login_page():
                         st.session_state.user = user_data  # Store user data in session
                         st.session_state.user_data = user_data  # For backward compatibility
                         st.session_state.username = user_data["username"]
+                        st.session_state.is_admin = user_data.get("is_admin", False)
                         
                         # Set page to chat
                         st.session_state.page = "chat"

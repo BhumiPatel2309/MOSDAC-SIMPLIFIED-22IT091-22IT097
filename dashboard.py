@@ -17,6 +17,240 @@ from fpdf import FPDF
 import tempfile
 import os
 
+# First, let's add the update_database_schema function
+def update_database_schema():
+    """Update database schema to include last_activity column if it doesn't exist"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if last_activity column exists
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'last_activity' not in columns:
+            # First add the column without a default value
+            cursor.execute('''
+                ALTER TABLE users 
+                ADD COLUMN last_activity TIMESTAMP
+            ''')
+            
+            # Then update all existing rows to set a default value
+            cursor.execute('''
+                UPDATE users 
+                SET last_activity = created_at 
+                WHERE last_activity IS NULL
+            ''')
+            
+            # Finally, modify the column to have a default for new rows
+            cursor.execute('''
+                CREATE TABLE users_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    is_admin BOOLEAN DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 1,
+                    total_queries INTEGER DEFAULT 0,
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Copy data to new table
+            cursor.execute('''
+                INSERT INTO users_new 
+                SELECT 
+                    id, username, email, password_hash, is_admin, 
+                    created_at, last_login, is_active, total_queries,
+                    COALESCE(last_activity, created_at) as last_activity
+                FROM users
+            ''')
+            
+            # Drop old table and rename new one
+            cursor.execute('DROP TABLE users')
+            cursor.execute('ALTER TABLE users_new RENAME TO users')
+            
+            # Recreate indexes and constraints
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users (username)
+            ''')
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (email)
+            ''')
+            
+            conn.commit()
+            print("✅ Database schema updated: Added last_activity column to users table")
+            
+    except Exception as e:
+        print(f"❌ Error updating database schema: {str(e)}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+# Update the create_tables function to include last_activity
+def create_tables():
+    """Create database tables if they don't exist"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Enable foreign keys
+    cursor.execute("PRAGMA foreign_keys = ON")
+    
+    # Create users table with last_activity column
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_admin BOOLEAN DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login TIMESTAMP,
+        is_active BOOLEAN DEFAULT 1,
+        total_queries INTEGER DEFAULT 0,
+        last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Rest of your table creation code...
+    
+    conn.commit()
+    conn.close()
+    update_database_schema()  # Ensure schema is updated after creating tables
+
+# Update the log_chat function
+def log_chat(user_id: int, query: str, response: str = None, response_time_ms: int = None) -> int:
+    """Log chat history with optional response time and update query count.
+    
+    Args:
+        user_id: The ID of the user sending the message
+        query: The user's message/query
+        response: The bot's response (optional)
+        response_time_ms: Time taken to generate response in milliseconds (optional)
+        
+    Returns:
+        int: The new total query count for the user
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # First, verify the user exists
+        cursor.execute('SELECT id, COALESCE(total_queries, 0) FROM users WHERE id = ?', (user_id,))
+        user_data = cursor.fetchone()
+        
+        if user_data is None:
+            raise ValueError(f"User with ID {user_id} not found")
+        
+        # Get current timestamp
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Log the chat
+        cursor.execute(
+            """INSERT INTO chat_history 
+               (user_id, query, response, response_time_ms, timestamp) 
+               VALUES (?, ?, ?, ?, ?)""",
+            (user_id, query, response, response_time_ms, current_time)
+        )
+        
+        # Update user's query count and last_activity
+        cursor.execute('''
+            UPDATE users 
+            SET total_queries = COALESCE(total_queries, 0) + 1,
+                last_activity = ?
+            WHERE id = ?
+        ''', (current_time, user_id))
+        
+        # Get the updated count
+        cursor.execute('SELECT COALESCE(total_queries, 0) FROM users WHERE id = ?', (user_id,))
+        result = cursor.fetchone()
+        new_count = result[0] if result else 0
+        
+        # Commit the transaction
+        conn.commit()
+        return new_count
+        
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        st.error(f"Error in log_chat: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+# Update the get_user_analytics function
+def get_user_analytics():
+    """Get fresh analytics data for all users' queries"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute('PRAGMA read_uncommitted = 1')
+        
+        # Get user query statistics
+        user_stats_query = '''
+        SELECT 
+            u.id as user_id,
+            u.username,
+            u.email,
+            u.created_at,
+            COALESCE(u.total_queries, 0) as total_queries,
+            u.last_activity as last_query_time
+        FROM users u
+        ORDER BY COALESCE(u.total_queries, 0) DESC
+        '''
+        
+        user_stats = pd.read_sql_query(user_stats_query, conn)
+        
+        # Get daily trends
+        daily_trends_query = '''
+        SELECT 
+            DATE(timestamp) as query_date,
+            COUNT(*) as query_count
+        FROM chat_history
+        WHERE timestamp >= date('now', '-30 days')
+        GROUP BY DATE(timestamp)
+        ORDER BY query_date
+        '''
+        daily_trends = pd.read_sql_query(daily_trends_query, conn)
+        
+        # Get top users
+        top_users_query = '''
+        SELECT 
+            u.username,
+            COUNT(*) as query_count
+        FROM chat_history ch
+        JOIN users u ON ch.user_id = u.id
+        GROUP BY u.id, u.username
+        ORDER BY query_count DESC
+        LIMIT 10
+        '''
+        top_users = pd.read_sql_query(top_users_query, conn)
+        
+        return {
+            'user_stats': user_stats,
+            'daily_trends': daily_trends,
+            'top_users': top_users
+        }
+        
+    except Exception as e:
+        st.error(f"Error fetching analytics: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
+    finally:
+        if conn:
+            conn.close()
+
 def log_activity(user_id: int, activity_type: str, activity_data: str = None):
     """Log user activity to the database"""
     conn = get_db_connection()
@@ -28,18 +262,70 @@ def log_activity(user_id: int, activity_type: str, activity_data: str = None):
     conn.commit()
     conn.close()
 
-def log_chat(user_id: int, query: str, response: str, response_time_ms: int = None):
-    """Log chat history with optional response time"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO chat_history 
-           (user_id, query, response, response_time_ms) 
-           VALUES (?, ?, ?, ?)""",
-        (user_id, query, response, response_time_ms)
-    )
-    conn.commit()
-    conn.close()
+def get_user_analytics():
+    """Get fresh analytics data for all users' queries"""
+    conn = None
+    try:
+        # Force a new connection to get fresh data
+        conn = get_db_connection()
+        
+        # Ensure we're not using a cached connection
+        conn.execute('PRAGMA read_uncommitted = 1')
+        
+        # Get user query statistics with the most recent data
+        user_stats_query = '''
+        SELECT 
+            u.id as user_id,
+            u.username,
+            u.email,
+            u.created_at,
+            COALESCE(u.total_queries, 0) as total_queries,
+            u.last_activity as last_query_time
+        FROM users u
+        ORDER BY COALESCE(u.total_queries, 0) DESC
+        '''
+        
+        user_stats = pd.read_sql_query(user_stats_query, conn)
+            
+        # Get daily trends
+        daily_trends_query = '''
+        SELECT 
+            DATE(timestamp) as query_date,
+            COUNT(*) as query_count
+        FROM chat_history
+        WHERE timestamp >= date('now', '-30 days')
+        GROUP BY DATE(timestamp)
+        ORDER BY query_date
+        '''
+        daily_trends = pd.read_sql_query(daily_trends_query, conn)
+        
+        # Get top users
+        top_users_query = '''
+        SELECT 
+            u.username,
+            COUNT(*) as query_count
+        FROM chat_history ch
+        JOIN users u ON ch.user_id = u.id
+        GROUP BY u.id, u.username
+        ORDER BY query_count DESC
+        LIMIT 10
+        '''
+        top_users = pd.read_sql_query(top_users_query, conn)
+        
+        return {
+            'user_stats': user_stats,
+            'daily_trends': daily_trends,
+            'top_users': top_users
+        }
+        
+    except Exception as e:
+        st.error(f"Error fetching analytics: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def get_user_stats(user_id: int) -> dict:
     """Get user statistics"""
@@ -309,6 +595,444 @@ def show_user_dashboard(user_id: int):
     else:
         st.info("No recent activities found.")
 
+def get_advanced_analytics():
+    """Get comprehensive analytics data including response times, engagement, and patterns"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        
+        # Response Time Analytics
+        response_time_query = '''
+        SELECT 
+            AVG(response_time_ms) as avg_response_time,
+            MIN(response_time_ms) as min_response_time,
+            MAX(response_time_ms) as max_response_time,
+            COUNT(*) as total_queries_with_time
+        FROM chat_history
+        WHERE response_time_ms IS NOT NULL
+        '''
+        response_stats = pd.read_sql_query(response_time_query, conn)
+        
+        # Response time trends over time
+        response_trends_query = '''
+        SELECT 
+            DATE(timestamp) as date,
+            AVG(response_time_ms) as avg_response_time,
+            COUNT(*) as query_count
+        FROM chat_history
+        WHERE response_time_ms IS NOT NULL
+            AND timestamp >= date('now', '-30 days')
+        GROUP BY DATE(timestamp)
+        ORDER BY date
+        '''
+        response_trends = pd.read_sql_query(response_trends_query, conn)
+        
+        # User Engagement Metrics
+        engagement_query = '''
+        SELECT 
+            COUNT(DISTINCT user_id) as total_users,
+            COUNT(DISTINCT CASE WHEN timestamp >= date('now', '-7 days') THEN user_id END) as active_users_7d,
+            COUNT(DISTINCT CASE WHEN timestamp >= date('now', '-30 days') THEN user_id END) as active_users_30d,
+            COUNT(*) as total_queries
+        FROM chat_history
+        '''
+        engagement_stats = pd.read_sql_query(engagement_query, conn)
+        
+        # Query Length Distribution
+        query_length_query = '''
+        SELECT 
+            LENGTH(query) as query_length,
+            COUNT(*) as count
+        FROM chat_history
+        GROUP BY LENGTH(query)
+        ORDER BY query_length
+        '''
+        query_lengths = pd.read_sql_query(query_length_query, conn)
+        
+        # Peak Usage Times - Hourly
+        hourly_usage_query = '''
+        SELECT 
+            CAST(strftime('%H', timestamp) AS INTEGER) as hour,
+            COUNT(*) as query_count
+        FROM chat_history
+        WHERE timestamp >= date('now', '-30 days')
+        GROUP BY hour
+        ORDER BY hour
+        '''
+        hourly_usage = pd.read_sql_query(hourly_usage_query, conn)
+        
+        # Day of week usage
+        daily_usage_query = '''
+        SELECT 
+            CASE CAST(strftime('%w', timestamp) AS INTEGER)
+                WHEN 0 THEN 'Sunday'
+                WHEN 1 THEN 'Monday'
+                WHEN 2 THEN 'Tuesday'
+                WHEN 3 THEN 'Wednesday'
+                WHEN 4 THEN 'Thursday'
+                WHEN 5 THEN 'Friday'
+                WHEN 6 THEN 'Saturday'
+            END as day_of_week,
+            COUNT(*) as query_count
+        FROM chat_history
+        WHERE timestamp >= date('now', '-30 days')
+        GROUP BY strftime('%w', timestamp)
+        ORDER BY CAST(strftime('%w', timestamp) AS INTEGER)
+        '''
+        daily_usage = pd.read_sql_query(daily_usage_query, conn)
+        
+        # User Segmentation - New vs Returning
+        user_segmentation_query = '''
+        SELECT 
+            u.id,
+            u.username,
+            u.created_at,
+            COUNT(ch.id) as total_queries,
+            MIN(ch.timestamp) as first_query,
+            MAX(ch.timestamp) as last_query,
+            CASE 
+                WHEN julianday('now') - julianday(u.created_at) <= 7 THEN 'New'
+                WHEN COUNT(ch.id) >= 10 THEN 'Power User'
+                WHEN MAX(ch.timestamp) >= date('now', '-7 days') THEN 'Active'
+                ELSE 'Inactive'
+            END as user_segment
+        FROM users u
+        LEFT JOIN chat_history ch ON u.id = ch.user_id
+        GROUP BY u.id, u.username, u.created_at
+        '''
+        user_segments = pd.read_sql_query(user_segmentation_query, conn)
+        
+        # User Growth Over Time
+        user_growth_query = '''
+        SELECT 
+            DATE(created_at) as date,
+            COUNT(*) as new_users
+        FROM users
+        GROUP BY DATE(created_at)
+        ORDER BY date
+        '''
+        user_growth = pd.read_sql_query(user_growth_query, conn)
+        
+        # Query Categories (based on length)
+        query_categories = query_lengths.copy()
+        if not query_categories.empty:
+            query_categories['category'] = pd.cut(
+                query_categories['query_length'],
+                bins=[0, 50, 100, 200, float('inf')],
+                labels=['Short (<50)', 'Medium (50-100)', 'Long (100-200)', 'Very Long (>200)']
+            )
+            query_categories = query_categories.groupby('category', observed=True)['count'].sum().reset_index()
+        
+        return {
+            'response_stats': response_stats,
+            'response_trends': response_trends,
+            'engagement_stats': engagement_stats,
+            'query_lengths': query_lengths,
+            'query_categories': query_categories,
+            'hourly_usage': hourly_usage,
+            'daily_usage': daily_usage,
+            'user_segments': user_segments,
+            'user_growth': user_growth
+        }
+        
+    except Exception as e:
+        st.error(f"Error fetching advanced analytics: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def show_analytics_dashboard():
+    """Display enhanced analytics dashboard with comprehensive metrics"""    
+    
+    # Clear any cached data
+    if 'analytics_data' in st.session_state:
+        del st.session_state.analytics_data
+    
+    # Show last update time
+    current_time = pd.Timestamp.now()
+    st.caption(f"Last updated: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Add refresh button
+    if st.button("🔄 Refresh Data"):
+        st.rerun()
+    
+    # Get fresh analytics data
+    try:
+        # Force a fresh data load
+        analytics = get_user_analytics()
+        advanced_analytics = get_advanced_analytics()
+        
+        if analytics is None or advanced_analytics is None:
+            st.error("❌ Failed to load analytics data. Please try again.")
+            return
+        
+        if not analytics or 'user_stats' not in analytics or analytics['user_stats'].empty:
+            st.info("ℹ️ No query data available yet. Start chatting to see analytics.")
+            return
+            
+        user_stats = analytics['user_stats']
+        daily_trends = analytics.get('daily_trends', pd.DataFrame())
+        
+        # ===== KEY METRICS SECTION =====
+        st.header("📈 Key Metrics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_users = len(user_stats)
+            st.metric("👥 Total Users", total_users)
+        
+        with col2:
+            total_queries = user_stats['total_queries'].sum()
+            st.metric("💬 Total Queries", total_queries)
+        
+        with col3:
+            if not advanced_analytics['response_stats'].empty:
+                avg_response = advanced_analytics['response_stats']['avg_response_time'].iloc[0]
+                st.metric("⚡ Avg Response Time", f"{avg_response:.0f} ms" if pd.notnull(avg_response) else "N/A")
+            else:
+                st.metric("⚡ Avg Response Time", "N/A")
+        
+        st.markdown("---")
+        
+        # ===== USER TABLE SECTION =====
+        st.header("👥 User Statistics Table")
+        if not user_stats.empty:
+            # Get additional user info from database
+            conn = get_db_connection()
+            try:
+                user_details_query = '''
+                SELECT 
+                    u.id,
+                    u.username,
+                    u.email,
+                    u.last_login,
+                    COALESCE(u.total_queries, 0) as total_queries,
+                    u.last_activity
+                FROM users u
+                ORDER BY COALESCE(u.total_queries, 0) DESC
+                '''
+                user_details = pd.read_sql_query(user_details_query, conn)
+                
+                if not user_details.empty:
+                    # Format the display dataframe
+                    display_df = user_details[['username', 'email', 'last_login', 'total_queries', 'last_activity']].copy()
+                    display_df.columns = ['Username', 'Email', 'Last Login', 'Total Queries', 'Last Activity']
+                    
+                    # Format datetime columns
+                    for col in ['Last Login', 'Last Activity']:
+                        if col in display_df.columns:
+                            display_df[col] = pd.to_datetime(display_df[col]).dt.strftime('%Y-%m-%d %H:%M')
+                    
+                    # Display the table with enhanced styling
+                    st.dataframe(
+                        display_df,
+                        column_config={
+                            "Username": st.column_config.TextColumn(
+                                "Username",
+                                help="User's username",
+                                width="medium"
+                            ),
+                            "Email": st.column_config.TextColumn(
+                                "Email",
+                                help="User's email address",
+                                width="large"
+                            ),
+                            "Last Login": st.column_config.TextColumn(
+                                "Last Login",
+                                help="Last login timestamp",
+                                width="medium"
+                            ),
+                            "Total Queries": st.column_config.NumberColumn(
+                                "Total Queries",
+                                help="Number of queries asked by the user",
+                                format="%d",
+                                width="small"
+                            ),
+                            "Last Activity": st.column_config.TextColumn(
+                                "Last Activity",
+                                help="Last activity timestamp",
+                                width="medium"
+                            )
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        height=400
+                    )
+                    
+                else:
+                    st.info("No user data available.")
+            finally:
+                conn.close()
+        else:
+            st.info("No user statistics available.")
+        
+        st.markdown("---")
+                
+        # ===== QUERY ANALYTICS SECTION =====
+        st.header("💬 Query Analytics")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Query Length Distribution
+            st.subheader("Query Complexity")
+            if not advanced_analytics['query_categories'].empty:
+                fig_categories = px.bar(
+                    advanced_analytics['query_categories'],
+                    x='category',
+                    y='count',
+                    title='Query Distribution by Length',
+                    labels={'category': 'Query Length', 'count': 'Number of Queries'},
+                    color='count',
+                    color_continuous_scale='Viridis'
+                )
+                st.plotly_chart(fig_categories, use_container_width=True)
+            else:
+                st.info("No query length data available.")
+        
+        with col2:
+            # Top Active Users
+            st.subheader("🏆 Top Active Users")
+            if 'top_users' in analytics and not analytics['top_users'].empty:
+                top_users = analytics['top_users'].head(10)
+                
+                fig_top = px.bar(
+                    top_users,
+                    x='query_count',
+                    y='username',
+                    orientation='h',
+                    title='Top 10 Users by Query Count',
+                    labels={'username': 'Username', 'query_count': 'Queries'},
+                    color='query_count',
+                    color_continuous_scale='Blues'
+                )
+                fig_top.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_top, use_container_width=True)
+            else:
+                st.info("No top users data available.")        
+        
+        # ===== PERFORMANCE METRICS SECTION =====
+        st.header("⚡ Performance Metrics")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Response Time Statistics
+            st.subheader("Response Time Stats")
+            if not advanced_analytics['response_stats'].empty:
+                resp_stats = advanced_analytics['response_stats'].iloc[0]
+                
+                perf_data = pd.DataFrame({
+                    'Metric': ['Average', 'Minimum', 'Maximum'],
+                    'Time (ms)': [
+                        resp_stats['avg_response_time'] if pd.notnull(resp_stats['avg_response_time']) else 0,
+                        resp_stats['min_response_time'] if pd.notnull(resp_stats['min_response_time']) else 0,
+                        resp_stats['max_response_time'] if pd.notnull(resp_stats['max_response_time']) else 0
+                    ]
+                })
+                
+                fig_perf = px.bar(
+                    perf_data,
+                    x='Metric',
+                    y='Time (ms)',
+                    title='Response Time Statistics',
+                    color='Time (ms)',
+                    color_continuous_scale='RdYlGn_r'
+                )
+                st.plotly_chart(fig_perf, use_container_width=True)
+            else:
+                st.info("No response time data available.")
+        
+        st.markdown("---")
+        
+        # ===== EXPORT COMPLETE STATISTICS =====        
+        try:
+            # Get user details again for export
+            conn = get_db_connection()
+            user_details_query = '''
+            SELECT 
+                u.id,
+                u.username,
+                u.email,
+                u.last_login,
+                COALESCE(u.total_queries, 0) as total_queries,
+                u.last_activity,
+                u.created_at
+            FROM users u
+            ORDER BY COALESCE(u.total_queries, 0) DESC
+            '''
+            complete_user_data = pd.read_sql_query(user_details_query, conn)
+            
+            # Get query history summary
+            query_summary = '''
+            SELECT 
+                u.username,
+                COUNT(ch.id) as query_count,
+                AVG(ch.response_time_ms) as avg_response_time,
+                MIN(ch.timestamp) as first_query,
+                MAX(ch.timestamp) as last_query
+            FROM users u
+            LEFT JOIN chat_history ch ON u.id = ch.user_id
+            GROUP BY u.id, u.username
+            ORDER BY query_count DESC
+            '''
+            query_data = pd.read_sql_query(query_summary, conn)
+            conn.close()
+            
+            # Create Excel file with multiple sheets
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Sheet 1: User Statistics
+                complete_user_data.to_excel(writer, sheet_name='User Statistics', index=False)
+                
+                # Sheet 2: Query Summary
+                query_data.to_excel(writer, sheet_name='Query Summary', index=False)
+                
+                # Sheet 3: Daily Trends
+                if not daily_trends.empty:
+                    daily_trends.to_excel(writer, sheet_name='Daily Trends', index=False)
+                
+                # Sheet 4: User Segments
+                if not advanced_analytics['user_segments'].empty:
+                    advanced_analytics['user_segments'].to_excel(writer, sheet_name='User Segments', index=False)
+                
+                # Sheet 5: Response Time Stats
+                if not advanced_analytics['response_stats'].empty:
+                    advanced_analytics['response_stats'].to_excel(writer, sheet_name='Response Times', index=False)
+                
+                # Sheet 6: Hourly Usage
+                if not advanced_analytics['hourly_usage'].empty:
+                    advanced_analytics['hourly_usage'].to_excel(writer, sheet_name='Hourly Usage', index=False)
+                
+                # Sheet 7: Daily Usage
+                if not advanced_analytics['daily_usage'].empty:
+                    advanced_analytics['daily_usage'].to_excel(writer, sheet_name='Weekly Pattern', index=False)
+            
+            excel_data = output.getvalue()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.download_button(
+                    label="📄 Download User Stats",
+                    data=excel_data,
+                    file_name=f"complete_analytics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                )
+            
+        except Exception as export_error:
+            st.error(f"Error preparing export: {str(export_error)}")
+        
+    except Exception as e:
+        st.error(f"❌ Error loading analytics: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+
+
 def show_admin_dashboard():
     """Display admin dashboard with analytics and user activity"""
     st.title("📊 Analytics Dashboard")
@@ -407,42 +1131,54 @@ def show_admin_dashboard():
         )
         
         if selected_user:
-            user_data = users_df[users_df['Username'] == selected_user].iloc[0]
-            
+            user_row = display_df[display_df['Username'] == selected_user].iloc[0]
+            user_id_query = data['user_activity'][data['user_activity']['username'] == selected_user]['user_id'].values[0]
             with st.expander(f"👤 {selected_user}'s Activity", expanded=True):
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("Total Queries", user_data['Query Count'])
+                    st.metric("Total Queries", user_row['Total Queries'])
                 with col2:
-                    st.metric("Role", user_data['Role'])
+                    st.metric("Role", user_row['Role'])
                 with col3:
-                    st.metric("Member Since", user_data['Joined'])
-                
-                # Show recent queries
-                st.subheader("Recent Queries")
+                    st.metric("Last Login", user_row['Last Login'])
+                # FULL Query history
+                st.subheader("Full Query History")
                 conn = get_db_connection()
                 try:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT query, response, timestamp 
-                        FROM chat_history 
-                        WHERE user_id = ? 
-                        ORDER BY timestamp DESC 
-                        LIMIT 10
-                    """, (user_data['ID'],))
-                    recent_queries = cursor.fetchall()
-                    
-                    if recent_queries:
-                        for i, (query, response, timestamp) in enumerate(recent_queries, 1):
-                            with st.container():
-                                st.markdown(f"**{i}. {timestamp}**")
-                                st.markdown(f"**Q:** {query}")
-                                st.markdown(f"**A:** {response}")
-                                st.markdown("---")
+                    user_query_df = pd.read_sql_query(
+                        "SELECT query AS Query, response AS Response, timestamp AS Time FROM chat_history WHERE user_id = ? ORDER BY timestamp DESC",
+                        conn,
+                        params=(user_id_query,)
+                    )
+                    if not user_query_df.empty:
+                        st.dataframe(user_query_df, use_container_width=True, hide_index=True)
+                        csv = user_query_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="💾 Download User's Queries as CSV",
+                            data=csv,
+                            file_name=f"{selected_user}_queries.csv",
+                            mime='text/csv',
+                        )
                     else:
-                        st.info("No recent queries from this user.")
+                        st.info("No queries found for this user.")
                 finally:
                     conn.close()
+                # Login history
+                st.subheader("Login History")
+                conn = get_db_connection()
+                try:
+                    login_history = pd.read_sql_query(
+                        "SELECT last_login FROM users WHERE id = ?",
+                        conn,
+                        params=(user_id_query,)
+                    )
+                    if not login_history.empty:
+                        st.dataframe(login_history, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No login history found for this user.")
+                finally:
+                    conn.close()
+                st.write(f"**Last Activity:** {user_row['Last Active']}")
         
         # Query Analytics Section
         st.markdown("---")
@@ -547,8 +1283,8 @@ def show_admin_dashboard():
     
     # Chat history section with search and filter
     st.subheader("💬 Chat History")
-    if stats['recent_chats']:
-        chat_df = pd.DataFrame(stats['recent_chats'], 
+    if data.get('recent_chats'):
+        chat_df = pd.DataFrame(data['recent_chats'], 
                              columns=['User', 'Role', 'Query', 'Response', 'Timestamp', 'ID'])
         
         # Add search and filter
@@ -602,3 +1338,6 @@ def show_admin_dashboard():
                 file_name=f"chat_history_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
                 mime='text/csv',
             )
+
+update_database_schema()
+

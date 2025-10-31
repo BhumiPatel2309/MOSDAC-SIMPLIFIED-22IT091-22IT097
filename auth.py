@@ -26,33 +26,107 @@ def migrate_database():
     """
     Run database migrations to update schema if needed
     """
+    print("Starting database migration...")
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Check if timestamp column exists in chat_history
-        cursor.execute("PRAGMA table_info(chat_history)")
-        columns = [column[1] for column in cursor.fetchall()]
+        # Disable foreign key constraints during migration
+        cursor.execute('PRAGMA foreign_keys = OFF')
         
-        # Add timestamp column if it doesn't exist
-        if 'timestamp' not in columns:
-            cursor.execute("""
-                ALTER TABLE chat_history 
-                ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            """)
-            conn.commit()
+        # Check if chat_history table exists first
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_history'")
+        if cursor.fetchone():
+            # Check if timestamp column exists in chat_history
+            cursor.execute("PRAGMA table_info(chat_history)")
+            columns = [column[1].lower() for column in cursor.fetchall()]
             
-            # Update existing records with current timestamp
-            cursor.execute("""
-                UPDATE chat_history 
-                SET timestamp = datetime('now') 
-                WHERE timestamp IS NULL
-            """)
-            conn.commit()
+            # Add timestamp column to chat_history if it doesn't exist
+            if 'timestamp' not in columns:
+                print("Migrating chat_history table to add timestamp column...")
+                # Create a temporary table with the new schema
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS chat_history_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        query TEXT NOT NULL,
+                        response TEXT,
+                        response_time_ms INTEGER,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                    )
+                ''')
+                
+                # Copy data from old table to new table
+                cursor.execute('''
+                    INSERT INTO chat_history_new (id, user_id, query, response, response_time_ms, timestamp)
+                    SELECT id, user_id, query, response, response_time_ms, datetime('now') 
+                    FROM chat_history
+                ''')
+                
+                # Drop the old table
+                cursor.execute('DROP TABLE IF EXISTS chat_history')
+                
+                # Rename the new table
+                cursor.execute('ALTER TABLE chat_history_new RENAME TO chat_history')
+                
+                # Recreate indexes
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_history_user_id ON chat_history(user_id)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_history_timestamp ON chat_history(timestamp)')
+                
+                print("Successfully added timestamp column to chat_history table")
+        
+        # Check if user_activity table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_activity'")
+        if cursor.fetchone():
+            # Check if timestamp column exists in user_activity
+            cursor.execute("PRAGMA table_info(user_activity)")
+            columns = [column[1].lower() for column in cursor.fetchall()]
+            
+            # Add timestamp column to user_activity if it doesn't exist
+            if 'timestamp' not in columns:
+                print("Migrating user_activity table to add timestamp column...")
+                # Create a temporary table with the new schema
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_activity_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        activity_type TEXT NOT NULL,
+                        activity_data TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                    )
+                ''')
+                
+                # Copy data from old table to new table
+                cursor.execute('''
+                    INSERT INTO user_activity_new (id, user_id, activity_type, activity_data, timestamp)
+                    SELECT id, user_id, activity_type, activity_data, datetime('now') 
+                    FROM user_activity
+                ''')
+                
+                # Drop the old table
+                cursor.execute('DROP TABLE IF EXISTS user_activity')
+                
+                # Rename the new table
+                cursor.execute('ALTER TABLE user_activity_new RENAME TO user_activity')
+                
+                # Recreate indexes
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_activity_user_id ON user_activity(user_id)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_activity_timestamp ON user_activity(timestamp)')
+                
+                print("Successfully added timestamp column to user_activity table")
+        
+        conn.commit()
+        print("Database migration completed successfully")
             
     except Exception as e:
-        print(f"Migration error: {e}")
+        print(f"Error during database migration: {e}")
+        conn.rollback()
+        raise
     finally:
+        # Re-enable foreign key constraints
+        cursor.execute('PRAGMA foreign_keys = ON')
         conn.close()
 
 
@@ -60,52 +134,126 @@ def init_database():
     """
     Initialize the database and create tables if they don't exist
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Create users table with proper constraints
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            role TEXT DEFAULT 'user',
-            last_login TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Create user_activity table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_activity (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            activity_type TEXT NOT NULL,
-            activity_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Create chat_history table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            query TEXT NOT NULL,
-            response TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-    
-    conn.commit()
-    conn.close()
-    
-    # Run migrations
-    migrate_database()
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Disable foreign key constraints temporarily to avoid issues with table recreation
+        cursor.execute('PRAGMA foreign_keys = OFF')
+        
+        try:
+            # Create users table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_admin BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1,
+                total_queries INTEGER DEFAULT 0
+            )
+            ''')
+            
+            # Create user_activity table with timestamp column
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                activity_type TEXT NOT NULL,
+                activity_data TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            ''')
+            
+            # Create chat_history table with timestamp column
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                response TEXT,
+                response_time_ms INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            ''')
+            
+            # Create user_queries table for analytics
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                query_count INTEGER DEFAULT 1,
+                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            ''')
+            
+            # Create indexes for better performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_history_user_id ON chat_history(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_history_timestamp ON chat_history(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_activity_user_id ON user_activity(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_activity_timestamp ON user_activity(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_queries_user_id ON user_queries(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_queries_username ON user_queries(username)')
+            
+            # Always delete and recreate admin user to ensure credentials are reset
+            admin_username = "admin"
+            admin_email = "admin@example.com"
+            admin_password = "admin123"  # In production, use a secure password
+            
+            # Delete existing admin user if exists
+            cursor.execute('DELETE FROM users WHERE username = ?', (admin_username,))
+            
+            # Create admin user with hashed password
+            password_hash = hashlib.sha256(admin_password.encode()).hexdigest()
+            cursor.execute(
+                'INSERT INTO users (username, email, password_hash, is_admin, is_active) VALUES (?, ?, ?, ?, ?)',
+                (admin_username, admin_email, password_hash, 1, 1)
+            )
+            print(f"[SUCCESS] Created admin user with username: {admin_username}, password: {admin_password}")
+            
+            # Always delete and recreate bhumi user to ensure credentials are reset
+            bhumi_username = "bhumi"
+            bhumi_email = "bhumi@example.com"
+            bhumi_password = "Bhumi@23"  # Using the password from run.bat
+            
+            # Delete existing bhumi user if exists
+            cursor.execute('DELETE FROM users WHERE username = ?', (bhumi_username,))
+            
+            # Create bhumi user with hashed password
+            password_hash = hashlib.sha256(bhumi_password.encode()).hexdigest()
+            cursor.execute(
+                'INSERT INTO users (username, email, password_hash, is_admin, is_active) VALUES (?, ?, ?, ?, ?)',
+                (bhumi_username, bhumi_email, password_hash, 1, 1)
+            )
+            print(f"[SUCCESS] Created bhumi user with username: {bhumi_username}, password: {bhumi_password}")
+            
+            # Re-enable foreign key constraints
+            cursor.execute('PRAGMA foreign_keys = ON')
+            
+            # Commit all changes
+            conn.commit()
+            
+        except Exception as e:
+            print(f"Error during database initialization: {e}")
+            if conn:
+                conn.rollback()
+            raise
+            
+    except Exception as e:
+        print(f"Failed to initialize database: {e}")
+        raise
+        
+    finally:
+        if conn:
+            conn.close()
 
 
 def hash_password(password):
@@ -198,8 +346,8 @@ def register_user(username, email, password, is_admin=False):
         
         # Insert new user
         cursor.execute(
-            "INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)",
-            (username, email, hashed_password, role)
+            "INSERT INTO users (username, email, password_hash, is_admin) VALUES (?, ?, ?, ?)",
+            (username, email, hashed_password, is_admin)
         )
         
         # Log the registration
@@ -238,7 +386,7 @@ def authenticate_user(username, password):
     try:
         # Get user by username
         cursor.execute(
-            "SELECT id, username, email, password, role FROM users WHERE username = ?",
+            "SELECT id, username, email, password_hash, is_admin FROM users WHERE username = ?",
             (username,)
         )
         user = cursor.fetchone()
@@ -248,7 +396,7 @@ def authenticate_user(username, password):
             
         # Verify password
         hashed_password = hash_password(password)
-        if user['password'] != hashed_password:
+        if user['password_hash'] != hashed_password:
             return False, "Invalid username or password", None
             
         # Update last login time
@@ -265,15 +413,13 @@ def authenticate_user(username, password):
         
         conn.commit()
         
-        # Return user data (without password)
-        user_data = {
+        # Return user data
+        return True, "Login successful", {
             'id': user['id'],
             'username': user['username'],
             'email': user['email'],
-            'role': user['role']
+            'is_admin': bool(user['is_admin'])
         }
-        
-        return True, "Login successful", user_data
         
     except sqlite3.Error as e:
         return False, f"Database error: {str(e)}", None
@@ -315,5 +461,7 @@ def get_user_by_id(user_id):
         return None
 
 
-# Initialize database when module is imported
+    # Initialize database when module is imported
 init_database()
+# Run migrations to ensure schema is up-to-date
+migrate_database()
